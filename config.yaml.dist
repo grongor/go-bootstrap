@@ -1,0 +1,11 @@
+app:
+    logger:
+        debug: true
+        colors: true
+        json: false
+        sentry:
+            dsn: ""
+            environment: "production"
+
+    localTime: false
+    panicWatch: true
