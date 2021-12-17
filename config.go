@@ -1,7 +1,6 @@
 package app
 
 import (
-	"errors"
 	"flag"
 	"os"
 	"path/filepath"
@@ -37,6 +36,7 @@ type genericConfig struct {
 		Panicwatch bool
 	}
 	logger *zap.SugaredLogger
+	appCtx *CliContext
 }
 
 func (c *genericConfig) Load(
@@ -50,26 +50,22 @@ func (c *genericConfig) Load(
 		panic("failed to read config file: " + err.Error())
 	}
 
-	configMap := make(map[string]interface{})
+	config := make(map[string]interface{})
 
-	err = yaml.Unmarshal(configBytes, &configMap)
+	err = yaml.Unmarshal(configBytes, &config)
 	if err != nil {
 		panic("failed to unmarshal YAML config file: " + err.Error())
 	}
 
 	decoderConfig := &mapstructure.DecoderConfig{
 		Result: c,
-		DecodeHook: func(f reflect.Type, t reflect.Type, data interface{}) (interface{}, error) {
-			if t != reflect.TypeOf(time.Second) {
-				return data, nil
-			}
-
-			if f.Kind() != reflect.String {
-				return nil, errors.New("duration must be a string, eg: \"10s\"")
-			}
-
-			return time.ParseDuration(data.(string))
-		},
+		DecodeHook: mapstructure.ComposeDecodeHookFunc(
+			mapstructure.StringToTimeDurationHookFunc(),
+			mapstructure.StringToTimeHookFunc(time.RFC3339),
+			mapstructure.StringToIPHookFunc(),
+			mapstructure.StringToIPNetHookFunc(),
+			mapstructure.TextUnmarshallerHookFunc(),
+		),
 	}
 
 	decoder, err := mapstructure.NewDecoder(decoderConfig)
@@ -77,7 +73,7 @@ func (c *genericConfig) Load(
 		panic("failed to create mapstructure.Decoder: " + err.Error())
 	}
 
-	if err = decoder.Decode(configMap); err != nil {
+	if err = decoder.Decode(config); err != nil {
 		panic("failed to decode config into the config struct: " + err.Error())
 	}
 
@@ -91,32 +87,70 @@ func (c *genericConfig) Load(
 		c.startPanicwatch(panicwatchConfig)
 	}
 
+	c.initializeExtensions(extensions, decoderConfig, config)
+}
+
+func (c *genericConfig) initializeExtensions(
+	extensions []Extension,
+	decoderConfig *mapstructure.DecoderConfig,
+	config map[string]interface{},
+) {
+	var baseDecodeHook mapstructure.DecodeHookFunc
+
+	if globalHooks := c.getGlobalConfigDecodeHooks(extensions); len(globalHooks) != 0 {
+		baseDecodeHook = mapstructure.ComposeDecodeHookFunc(append(globalHooks, decoderConfig.DecodeHook)...)
+	} else {
+		baseDecodeHook = decoderConfig.DecodeHook
+	}
+
 	for _, extension := range extensions {
-		err = extension.Initialize(
-			func(extensionConfig interface{}) {
+		err := extension.Initialize(
+			func(extensionConfig interface{}, decodeHooks ...mapstructure.DecodeHookFunc) {
 				if extensionConfig == nil {
 					c.logger.Panic("app extension config is nil; don't call configLoader if you don't use any config")
 				}
 
+				if len(decodeHooks) != 0 {
+					decodeHooks = append(decodeHooks, baseDecodeHook)
+					decoderConfig.DecodeHook = mapstructure.ComposeDecodeHookFunc(decodeHooks...)
+				} else {
+					decoderConfig.DecodeHook = baseDecodeHook
+				}
+
 				decoderConfig.Result = extensionConfig
 
-				decoder, err = mapstructure.NewDecoder(decoderConfig)
+				decoder, err := mapstructure.NewDecoder(decoderConfig)
 				if err != nil {
 					c.logger.Fatalw("failed to create mapstructure.Decoder for app extension", zap.Error(err))
 				}
 
-				if err = decoder.Decode(configMap); err != nil {
+				if err = decoder.Decode(config); err != nil {
 					c.logger.Fatalw("failed to unmarshal app extension config", zap.Error(err))
 				}
 
 				if extensionConfig, ok := extensionConfig.(ConfigValidator); ok {
 					if err = extensionConfig.Validate(); err != nil {
-						errs := multierr.Errors(err)
-						if len(errs) > 1 {
-							c.logger.Fatalw("app extension config validation failed", "errors", errs)
+						isConfigExtension := true
+						logger := c.logger
+
+						if _, ok := extension.(*appConfigExtension); !ok {
+							isConfigExtension = false
+							logger = logger.With(zap.Stringer("extension", reflect.TypeOf(extension)))
 						}
 
-						c.logger.Fatalw("app extension config validation failed", zap.Error(err))
+						if errs := multierr.Errors(err); len(errs) > 1 {
+							if isConfigExtension {
+								logger.Fatalw("config validation failed", "errors", errs)
+							} else {
+								logger.Fatalw("app extension config validation failed", "errors", errs)
+							}
+						}
+
+						if isConfigExtension {
+							logger.Fatalw("config validation failed", zap.Error(err))
+						} else {
+							logger.Fatalw("app extension config validation failed", zap.Error(err))
+						}
 					}
 				}
 			},
@@ -128,7 +162,17 @@ func (c *genericConfig) Load(
 	}
 }
 
-func (c *genericConfig) readConfigFile() ([]byte, error) {
+func (c *genericConfig) getGlobalConfigDecodeHooks(extensions []Extension) []mapstructure.DecodeHookFunc {
+	var hooks []mapstructure.DecodeHookFunc
+
+	for _, extension := range extensions {
+		hooks = append(hooks, extension.GlobalConfigDecodeHooks()...)
+	}
+
+	return hooks
+}
+
+func (*genericConfig) readConfigFile() ([]byte, error) {
 	configFile := flag.String("config", "", "path to a YAML config file")
 
 	flag.Parse()
@@ -246,8 +290,7 @@ func (c *genericConfig) setupSentryLogging(sentryConfig func(*sentry.ClientOptio
 		sentryConfig(&options)
 	}
 
-	err := sentry.Init(options)
-	if err != nil {
+	if err := sentry.Init(options); err != nil {
 		logger.Fatal("failed to initialize Sentry SDK", zap.Error(err))
 	}
 
@@ -267,10 +310,12 @@ func (c *genericConfig) startPanicwatch(panicwatchConfig func(*panicwatch.Config
 			logger.Fatalw(p.Message, "panic", p)
 		},
 		OnWatcherError: func(err error) {
-			logger.Fatalw("watcher error", zap.Error(err))
+			logger.Errorw("watcher error", zap.Error(err))
+			c.appCtx.Shutdown()
 		},
 		OnWatcherDied: func(err error) {
-			logger.Fatalw("watcher died", zap.Error(err))
+			logger.Errorw("watcher died", zap.Error(err))
+			c.appCtx.Shutdown()
 		},
 	}
 
@@ -278,8 +323,7 @@ func (c *genericConfig) startPanicwatch(panicwatchConfig func(*panicwatch.Config
 		panicwatchConfig(&config, c.logger)
 	}
 
-	err := panicwatch.Start(config)
-	if err != nil {
+	if err := panicwatch.Start(config); err != nil {
 		c.logger.Fatalw("failed to start panicwatch", zap.Error(err))
 	}
 }

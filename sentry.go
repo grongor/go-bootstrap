@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"errors"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
@@ -12,10 +13,9 @@ import (
 	"github.com/grongor/panicwatch"
 )
 
-type PanicwatchSentryIntegration struct {
-}
+type PanicwatchSentryIntegration struct{}
 
-func (p *PanicwatchSentryIntegration) Name() string {
+func (*PanicwatchSentryIntegration) Name() string {
 	return "github.com/grongor/panicwatch-sentry"
 }
 
@@ -23,15 +23,15 @@ func (p *PanicwatchSentryIntegration) SetupOnce(client *sentry.Client) {
 	client.AddEventProcessor(p.processor)
 }
 
-func (p *PanicwatchSentryIntegration) processor(event *sentry.Event, _ *sentry.EventHint) *sentry.Event {
+func (*PanicwatchSentryIntegration) processor(event *sentry.Event, _ *sentry.EventHint) *sentry.Event {
 	for key, value := range event.Extra {
 		panicInfo, ok := value.(panicwatch.Panic)
 		if !ok {
 			continue
 		}
 
-		panicErr, ok := panicInfo.AsError().(*goerrors.Error)
-		if !ok {
+		var panicErr *goerrors.Error
+		if !errors.As(panicInfo.AsError(), &panicErr) {
 			continue
 		}
 
@@ -84,7 +84,7 @@ type TrimPathSentryIntegration struct {
 	AppPath string
 }
 
-func (t *TrimPathSentryIntegration) Name() string {
+func (*TrimPathSentryIntegration) Name() string {
 	return "github.com/grongor/go-bootstrap/trim-path-sentry-integration"
 }
 
@@ -105,14 +105,19 @@ func (t *TrimPathSentryIntegration) SetupOnce(client *sentry.Client) {
 		return
 	}
 
+	t.extractAppPathAndModuleFromStack()
+}
+
+func (t *TrimPathSentryIntegration) extractAppPathAndModuleFromStack() {
 	buf := make([]byte, 1<<20)
+
 	for {
-		n := runtime.Stack(buf, true)
-		if n < len(buf) {
+		if n := runtime.Stack(buf, true); n < len(buf) {
 			buf = buf[:n]
 
 			break
 		}
+
 		buf = make([]byte, 2*len(buf))
 	}
 

@@ -6,14 +6,15 @@ import (
 
 	"github.com/getsentry/sentry-go"
 	"github.com/grongor/panicwatch"
+	"github.com/mitchellh/mapstructure"
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
 var (
-	Release string
+	Release string //nolint:gochecknoglobals
 
-	instance = &Application{}
+	instance = &Application{} //nolint:gochecknoglobals
 )
 
 type Application struct {
@@ -27,14 +28,14 @@ type Application struct {
 	config *genericConfig
 }
 
-func (app *Application) WithConfig(config interface{}) *Application {
-	app.checkStarted(false)
+func (app *Application) WithConfig(config interface{}, decodeHooks ...mapstructure.DecodeHookFunc) *Application {
+	app.checkNotStarted()
 
-	return app.WithExtensions(&appConfigExtension{config: config})
+	return app.WithExtensions(&appConfigExtension{config: config, decodeHooks: decodeHooks})
 }
 
 func (app *Application) WithTerminationSignals(signals ...os.Signal) *Application {
-	app.checkStarted(false)
+	app.checkNotStarted()
 
 	app.terminationSignals = append(app.terminationSignals, signals...)
 
@@ -42,7 +43,7 @@ func (app *Application) WithTerminationSignals(signals ...os.Signal) *Applicatio
 }
 
 func (app *Application) WithExtensions(extensions ...Extension) *Application {
-	app.checkStarted(false)
+	app.checkNotStarted()
 
 	app.extensions = append(app.extensions, extensions...)
 
@@ -50,7 +51,7 @@ func (app *Application) WithExtensions(extensions ...Extension) *Application {
 }
 
 func (app *Application) WithZapConfig(zapConfig func(*zap.Config)) *Application {
-	app.checkStarted(false)
+	app.checkNotStarted()
 
 	app.zapConfig = zapConfig
 
@@ -58,7 +59,7 @@ func (app *Application) WithZapConfig(zapConfig func(*zap.Config)) *Application 
 }
 
 func (app *Application) WithSentryConfig(sentryConfig func(*sentry.ClientOptions)) *Application {
-	app.checkStarted(false)
+	app.checkNotStarted()
 
 	app.sentryConfig = sentryConfig
 
@@ -68,7 +69,7 @@ func (app *Application) WithSentryConfig(sentryConfig func(*sentry.ClientOptions
 func (app *Application) WithPanicwatchConfig(
 	panicwatchConfig func(*panicwatch.Config, *zap.SugaredLogger),
 ) *Application {
-	app.checkStarted(false)
+	app.checkNotStarted()
 
 	app.panicwatchConfig = panicwatchConfig
 
@@ -76,16 +77,15 @@ func (app *Application) WithPanicwatchConfig(
 }
 
 func (app *Application) Run(appCallback func(appCtx context.Context, logger *zap.SugaredLogger)) {
-	app.checkStarted(true)
+	app.doStart()
 
-	app.config = &genericConfig{}
+	appCtx := NewCliContext(app.terminationSignals...)
+	app.config = &genericConfig{appCtx: appCtx}
 
 	app.config.Load(app.extensions, app.zapConfig, app.sentryConfig, app.panicwatchConfig)
 
 	logger := app.config.logger
 	defer logger.Sync()
-
-	appCtx := NewCliContext(app.terminationSignals...)
 
 	for _, extension := range app.extensions {
 		extension.Start(appCtx, logger)
@@ -124,22 +124,22 @@ func (app *Application) Run(appCallback func(appCtx context.Context, logger *zap
 }
 
 func (app *Application) Start(appCallback func(appCtx Context, logger *zap.SugaredLogger)) {
-	app.checkStarted(true)
+	app.doStart()
 
-	app.config = &genericConfig{}
+	appCtx := NewCliContext(app.terminationSignals...)
+	app.config = &genericConfig{appCtx: appCtx}
 
 	app.config.Load(app.extensions, app.zapConfig, app.sentryConfig, app.panicwatchConfig)
 
 	logger := app.config.logger
 	defer logger.Sync()
 
-	appCtx := NewCliContext(app.terminationSignals...)
-
 	for _, extension := range app.extensions {
 		extension.Start(appCtx, logger)
 	}
 
 	appCtx.StartWorker(func() {
+		logger.Info("starting application")
 		appCallback(appCtx, logger)
 		logger.Info("application started")
 	})
@@ -161,12 +161,16 @@ func (app *Application) Start(appCallback func(appCtx Context, logger *zap.Sugar
 	logger.Info("application finished, exiting now")
 }
 
-func (app *Application) checkStarted(doStart bool) {
-	if doStart {
-		if app.started.CAS(false, true) {
-			return
-		}
-	} else if !app.started.Load() {
+func (app *Application) doStart() {
+	if app.started.CAS(false, true) {
+		return
+	}
+
+	panic("application has already been started")
+}
+
+func (app *Application) checkNotStarted() {
+	if !app.started.Load() {
 		return
 	}
 

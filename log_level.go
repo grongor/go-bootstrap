@@ -7,7 +7,7 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-var logLevel *zap.AtomicLevel
+var logLevel *zap.AtomicLevel //nolint:gochecknoglobals
 
 func LogLevel() zapcore.Level {
 	return logLevel.Level()

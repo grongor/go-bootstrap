@@ -24,7 +24,7 @@ type CliContext struct {
 	wg     sync.WaitGroup
 }
 
-func (c *CliContext) Deadline() (deadline time.Time, ok bool) {
+func (*CliContext) Deadline() (deadline time.Time, ok bool) {
 	return time.Time{}, false
 }
 
@@ -36,7 +36,7 @@ func (c *CliContext) Err() error {
 	return c.ctx.Err()
 }
 
-func (c *CliContext) Value(key interface{}) interface{} {
+func (*CliContext) Value(interface{}) interface{} {
 	return nil
 }
 
